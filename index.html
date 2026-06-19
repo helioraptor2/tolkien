@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Map of Middle-earth — Vector / Canvas</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden;
+    font-family: "Palatino Linotype", Palatino, Georgia, serif; }
+  #map { display: block; width: 100vw; height: 100vh; cursor: grab; background: #efe6cf; }
+  #map.dragging { cursor: grabbing; }
+
+  .ui { position: absolute; z-index: 10; user-select: none; }
+
+  #title {
+    top: 12px; left: 50%; transform: translateX(-50%);
+    background: rgba(244,236,214,.92); border: 1px solid #b7a27a; border-radius: 8px;
+    padding: 6px 18px; font-size: 20px; letter-spacing: 1px; color: #4a3b1e;
+    box-shadow: 0 2px 8px rgba(0,0,0,.25); pointer-events: none; white-space: nowrap;
+  }
+
+  #controls { top: 12px; left: 12px; display: flex; flex-direction: column; gap: 6px; }
+  #controls button {
+    width: 38px; height: 38px; font-size: 20px; font-weight: bold; line-height: 1;
+    background: rgba(244,236,214,.95); border: 1px solid #b7a27a; border-radius: 6px;
+    color: #4a3b1e; cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,.2);
+  }
+  #controls button:hover { background: #fff7e2; }
+  #controls button#reset, #controls button#lbl { font-size: 14px; }
+
+  #legend {
+    bottom: 12px; left: 12px; background: rgba(244,236,214,.92);
+    border: 1px solid #b7a27a; border-radius: 8px; padding: 8px 12px;
+    font-size: 13px; color: #4a3b1e; box-shadow: 0 2px 8px rgba(0,0,0,.25);
+  }
+  #legend .row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  #legend .sw { width: 22px; height: 12px; border: 1px solid #6b5d3e; border-radius: 2px; }
+
+  #readout {
+    bottom: 12px; right: 12px; background: rgba(244,236,214,.92);
+    border: 1px solid #b7a27a; border-radius: 6px; padding: 4px 10px;
+    font-size: 12px; color: #4a3b1e; font-family: monospace;
+  }
+</style>
+</head>
+<body>
+  <canvas id="map"></canvas>
+  <div id="title" class="ui">⚔ Middle-earth ⚔</div>
+  <div id="controls" class="ui">
+    <button id="zin" title="Zoom in">+</button>
+    <button id="zout" title="Zoom out">−</button>
+    <button id="reset" title="Reset view">⤢</button>
+    <button id="lbl" title="Toggle captions">A</button>
+    <button id="grid" title="Toggle coordinate grid">#</button>
+    <button id="cont" title="Toggle contour lines">≈</button>
+  </div>
+  <div id="legend" class="ui">
+    <div class="row"><span class="sw" style="background:#9ec5d8"></span>Water</div>
+    <div class="row"><span class="sw" style="background:#8aa86b"></span>Forest</div>
+    <div class="row"><span class="sw" style="background:#d8cdb0"></span>Mountains</div>
+    <div class="row"><span class="sw" style="background:#cdbf94"></span>Hills</div>
+    <div class="row"><span class="sw" style="background:#fff;border:1px solid #6b5d3e"></span>Snow / peak</div>
+    <div class="row"><span class="sw" style="background:#a77b3e;border:none;height:3px"></span>Road</div>
+    <div class="row"><span class="sw" style="background:#5f93ad;border:none;height:3px"></span>River</div>
+  </div>
+  <div id="readout" class="ui">—</div>
+
+<script>
+"use strict";
+
+/* =====================================================================
+   CARTOGRAPHIC DATA MODEL
+   Every feature is a plain object with world coordinates (units, not
+   pixels). Nothing is a bitmap — the renderer draws all of this onto
+   the canvas. World space: x east (0..1000), y south (0..760).
+   ===================================================================== */
+
+const WORLD = { w: 1000, h: 760 };
+
+// --- Water bodies: filled polygons (label = caption) -----------------
+const waterBodies = [
+  { name: "Belegaer  ·  The Great Sea", lx: 70, ly: 380, poly: [
+    [0,0],[235,0],[205,70],[165,150],[200,230],[150,310],[185,400],
+    [140,500],[175,600],[120,700],[150,760],[0,760] ] },
+  { name: "Gulf of Lune", lx: 175, ly: 175, poly: [
+    [165,150],[235,150],[250,178],[232,205],[200,200],[185,175] ] },
+  { name: "Sea of Rhûn", lx: 875, ly: 365, poly: [
+    [840,300],[905,310],[935,360],[915,415],[855,430],[815,395],[820,340] ] },
+  { name: "Long Lake", lx: 724, ly: 208, poly: [
+    [712,178],[735,182],[742,210],[728,238],[710,225],[706,198] ] },
+  { name: "Lake Evendim", lx: 264, ly: 256, poly: [
+    [250,235],[278,238],[284,262],[266,278],[246,266],[244,248] ] },
+  { name: "Sea of Núrnen", lx: 800, ly: 600, poly: [
+    [778,580],[820,584],[834,608],[816,632],[780,628],[768,602] ] },
+  { name: "Bay of Belfalas", lx: 555, ly: 742, poly: [
+    [430,722],[520,706],[600,712],[690,730],[700,760],[430,760] ] },
+];
+
+// --- Rivers: polylines (width is a world-unit field) -----------------
+// Each river is laid out so that it is a STEEPEST-DESCENT line of the
+// elevation field that the contours are traced from. The terrain is
+// carved into a matching valley for every river (see buildRivers), which
+// guarantees two cartographic invariants:
+//   • the river crosses every contour line at ~90° (it runs down the
+//     gradient, and contours are level sets ⟂ to the gradient), and
+//   • the river never flows uphill (the carved valley floor is monotone).
+// `route` is the control polyline; `trunk` names the river it empties into
+// (otherwise it reaches a sea/lake). `path` is filled in at load time with
+// a smoothed, resampled copy of `route` — that is what gets drawn AND
+// carved, so the picture and the physics never disagree.
+const rivers = [
+  // Anduin: rises in the north, empties into the Bay of Belfalas.
+  { name: "Anduin", width: 5, route: [
+    [568,96],[574,165],[578,235],[586,305],[588,375],[598,445],[602,515],[606,585],[609,655],[610,726] ] },
+  // Gwathló: runs west off the Misty Mountains into the Great Sea (Belegaer).
+  { name: "Gwathló", width: 4, route: [ [486,344],[455,360],[400,382],[300,395],[170,401] ] },
+  // Isen: flows southwest into the Great Sea.
+  { name: "River Isen", width: 3, route: [ [482,478],[440,510],[390,535],[320,560],[230,572],[152,578] ] },
+  // Lhûn: flows south into the Gulf of Lune.
+  { name: "River Lhûn", width: 4, route: [ [180,80],[195,120],[205,162] ] },
+  // Celduin: from Long Lake to the Sea of Rhûn (a near-level reach).
+  { name: "Celduin", width: 4, route: [ [726,212],[760,260],[800,320],[842,355] ] },
+  // Baranduin (Brandywine): out of Lake Evendim, south through the Shire to the sea.
+  { name: "Baranduin", width: 4, route: [ [266,262],[300,292],[330,322],[332,358],[300,374],[244,374],[188,368],[150,360] ] },
+  // Forest River: out of the Grey Mountains, through northern Mirkwood to the Long Lake.
+  { name: "Forest River", width: 3, route: [ [652,92],[672,122],[694,156],[712,190] ] },
+  // Morthond (Blackroot): down from the White Mountains to the Bay of Belfalas.
+  { name: "Morthond", width: 3, route: [ [468,578],[460,620],[458,665],[458,700],[460,722] ] },
+  // Gilrain: a vale of Lebennin, to the Bay of Belfalas near Linhir.
+  { name: "Gilrain", width: 2, route: [ [556,582],[560,624],[566,666],[572,706],[576,724] ] },
+  // Bruinen: mountain river that joins the Gwathló.
+  { name: "Bruinen", width: 3, trunk: "Gwathló", route: [ [500,290],[472,318],[452,344],[440,361] ] },
+  // Carnen: from the Iron Hills, swinging east then joining the Celduin.
+  { name: "Carnen", width: 3, trunk: "Celduin", route: [ [772,150],[798,215],[820,272],[816,305],[806,322] ] },
+  // Entwash: drains Rohan/Fangorn south-east to meet the Anduin (Nindalf).
+  { name: "Entwash", width: 3, trunk: "Anduin", route: [ [505,452],[535,470],[565,484],[588,496],[601,504] ] },
+  // Morgulduin: down the west flank of the Ephel Dúath into the Anduin.
+  { name: "Morgulduin", width: 2, trunk: "Anduin", route: [ [693,561],[660,567],[628,574],[608,580] ] },
+  // Gladden: from the Misty Mountains, swinging south-east into the Anduin.
+  { name: "Gladden", width: 2, trunk: "Anduin", route: [ [522,316],[548,330],[574,346],[588,358] ] },
+  // Mitheithel (Hoarwell): from the Ettenmoors south to join the Gwathló.
+  { name: "Mitheithel", width: 3, trunk: "Gwathló", route: [ [470,150],[458,215],[442,285],[424,340],[410,372] ] },
+  // Celebrant (Silverlode): from Moria through Lothlórien to the Anduin.
+  { name: "Celebrant", width: 3, trunk: "Anduin", route: [ [505,298],[522,338],[548,372],[574,386],[590,392] ] },
+  // Limlight: out of Fangorn's eaves to the Anduin (north bound of Rohan).
+  { name: "Limlight", width: 2, trunk: "Anduin", route: [ [528,438],[556,446],[582,449],[598,448] ] },
+  // Snowbourn: from Dunharrow past Edoras to the Entwash.
+  { name: "Snowbourn", width: 2, trunk: "Entwash", route: [ [494,562],[506,536],[512,502],[510,468] ] },
+  // Poros: the Harad border, west to the Anduin near its mouths.
+  { name: "Poros", width: 2, trunk: "Anduin", route: [ [712,640],[682,664],[652,688],[626,704],[612,706] ] },
+  // Adorn: off the White Mountains' western arm to the Isen.
+  { name: "Adorn", width: 2, trunk: "River Isen", route: [ [452,548],[440,528],[438,514] ] },
+];
+
+// --- Forests: filled polygons ----------------------------------------
+const forests = [
+  { name: "Mirkwood", lx: 680, ly: 250, poly: [
+    [618,150],[700,140],[745,175],[748,260],[715,345],[645,360],[612,300],[615,220] ] },
+  { name: "Fangorn", lx: 506, ly: 448, poly: [ [470,420],[535,415],[548,455],[510,478],[468,462] ] },
+  { name: "Lóthlórien", lx: 560, ly: 384, poly: [ [535,360],[582,358],[590,395],[558,408],[532,390] ] },
+  { name: "Old Forest", lx: 320, ly: 318, poly: [ [298,300],[340,298],[348,326],[316,338],[294,322] ] },
+  { name: "Trollshaws", lx: 448, ly: 278, poly: [ [428,262],[470,258],[480,286],[452,300],[424,286] ] },
+  { name: "Drúadan", lx: 588, ly: 558, poly: [ [566,545],[608,542],[616,566],[586,578],[562,564] ] },
+  { name: "Firien Wood", lx: 558, ly: 522, poly: [ [540,512],[576,510],[582,530],[556,540],[536,528] ] },
+  { name: "Ithilien", lx: 690, ly: 612, poly: [ [668,560],[712,558],[720,608],[700,664],[672,642],[660,600] ] },
+  { name: "Chetwood", lx: 392, ly: 288, poly: [ [378,276],[406,274],[412,296],[388,304],[372,290] ] },
+  { name: "Eryn Vorn", lx: 230, ly: 454, poly: [ [210,432],[248,430],[256,460],[230,478],[206,458] ] },
+  { name: "Woody End", lx: 282, ly: 324, poly: [ [270,314],[296,312],[302,332],[280,340],[264,326] ] },
+];
+
+// --- Mountain ranges: ridge polylines (renderer stamps peaks) ---------
+const mountainRanges = [
+  { name: "Misty Mountains",  scale: 0.85, lx: 506, ly: 250, ridge: [
+    [520,80],[508,150],[516,220],[500,290],[514,355],[506,415] ] },
+  { name: "Ered Luin",        scale: 0.66, lx: 226, ly: 150, ridge: [ [240,108],[258,158],[244,212] ] },
+  { name: "Grey Mountains",   scale: 0.72, lx: 680, ly: 60, ridge: [ [560,72],[640,56],[720,66],[800,88] ] },
+  { name: "Iron Hills",       scale: 0.55, lx: 820, ly: 150, ridge: [ [792,132],[840,128],[882,140] ] },
+  { name: "Ered Nimrais",     scale: 0.80, lx: 540, ly: 580, ridge: [ [430,560],[510,572],[590,560],[662,574] ] },
+  { name: "Ephel Dúath",      scale: 0.72, lx: 678, ly: 520, ridge: [ [702,460],[700,520],[702,585] ] },
+  { name: "Ered Lithui",      scale: 0.72, lx: 772, ly: 432, ridge: [ [702,458],[772,446],[842,462] ] },
+  { name: "Mts. of Mirkwood", scale: 0.50, lx: 672, ly: 238, ridge: [ [650,210],[680,240],[700,276] ] },
+  { name: "Mts. of Angmar",   scale: 0.60, lx: 360, ly: 62,  ridge: [ [300,72],[360,60],[420,82] ] },
+];
+
+// --- Hills: filled blobs with a caption ------------------------------
+const hills = [
+  { name: "Weather Hills", poly: [ [398,272],[420,268],[424,288],[404,296],[392,284] ] },
+  { name: "Emyn Muil", poly: [ [600,420],[636,416],[644,444],[612,456],[592,438] ] },
+  { name: "Barrow-downs", poly: [ [332,326],[362,324],[368,344],[342,352],[326,340] ] },
+  { name: "North Downs", poly: [ [350,238],[398,236],[406,258],[372,268],[344,254] ] },
+  { name: "White Downs", poly: [ [214,302],[244,300],[250,320],[224,328],[208,316] ] },
+  { name: "Emyn Arnen", poly: [ [672,596],[702,594],[710,616],[686,626],[666,612] ] },
+  { name: "Pinnath Gelin", poly: [ [458,622],[490,620],[498,642],[470,652],[450,638] ] },
+];
+
+// --- Small lakes & tarns: cosmetic overlays (do NOT affect the elevation
+//     field, so high mountain tarns don't punch holes in the contours). ----
+const lakes = [
+  { name: "Mirrormere", lx: 528, ly: 312, poly: [ [521,300],[534,301],[538,308],[530,314],[520,307] ] },
+  { name: "Nen Hithoel", lx: 600, ly: 498, poly: [ [589,486],[612,489],[617,503],[605,514],[587,508],[584,495] ] },
+];
+
+// --- Marshes & fens: cosmetic overlays drawn with a reed stipple. ----------
+const marshes = [
+  { name: "Dead Marshes",       lx: 656, ly: 508, poly: [ [638,492],[672,490],[684,510],[668,528],[642,520],[632,506] ] },
+  { name: "Nindalf (Wetwang)",  lx: 596, ly: 514, poly: [ [580,502],[608,500],[616,518],[600,530],[578,520] ] },
+  { name: "Midgewater Marshes", lx: 398, ly: 306, poly: [ [386,296],[412,294],[418,312],[394,320],[380,308] ] },
+  { name: "Nîn-in-Eilph",       lx: 420, ly: 392, poly: [ [404,380],[436,378],[444,398],[420,408],[400,396] ] },
+  { name: "Gladden Fields",     lx: 586, ly: 362, poly: [ [572,350],[598,348],[606,366],[586,376],[568,364] ] },
+];
+
+// --- Roads: polylines -------------------------------------------------
+// Roads cross the mountains ONLY at passes (see `passes` above).
+const roads = [
+  // Grey Havens -> Bree -> Rivendell -> High Pass -> down to the Anduin.
+  { name: "Great East Road", path: [
+    [168,250],[262,300],[362,300],[440,288],[500,278],[504,302],[545,312],[578,330] ] },
+  // West foothills south through the Gap of Rohan to Edoras & Minas Tirith.
+  { name: "North-South Road", path: [
+    [468,305],[460,372],[463,435],[470,500],[512,540],[580,575],[640,600] ] },
+  // From the Anduin crossing north-east to Erebor (stays east of the peaks).
+  { name: "Dwarf Road", path: [ [578,330],[630,288],[685,234],[730,176] ] },
+  { name: "Greenway", path: [ [362,300],[350,360],[340,420],[330,470] ] },
+  { name: "Harad Road", path: [ [640,600],[660,640],[700,690],[740,740] ] },
+];
+
+// --- Settlements & landmarks: points ---------------------------------
+const places = [
+  { name: "Mithlond (Grey Havens)", x: 168, y: 250, kind: "town" },
+  { name: "Hobbiton (Shire)", x: 262, y: 300, kind: "town" },
+  { name: "Michel Delving", x: 232, y: 312, kind: "town" },
+  { name: "Bree",             x: 362, y: 300, kind: "town" },
+  { name: "Fornost",          x: 372, y: 250, kind: "ruin" },
+  { name: "Annúminas",        x: 268, y: 240, kind: "ruin" },
+  { name: "Tharbad",          x: 388, y: 382, kind: "ruin" },
+  { name: "Rivendell",        x: 500, y: 272, kind: "town" },
+  { name: "Carrock",          x: 566, y: 280, kind: "fort" },
+  { name: "Isengard",         x: 482, y: 478, kind: "tower" },
+  { name: "Edoras",           x: 512, y: 540, kind: "town" },
+  { name: "Helm's Deep",      x: 470, y: 518, kind: "fort" },
+  { name: "Dol Guldur",       x: 700, y: 330, kind: "tower" },
+  { name: "Dale",             x: 742, y: 170, kind: "town" },
+  { name: "Esgaroth",         x: 716, y: 205, kind: "town" },
+  { name: "Minas Tirith",     x: 640, y: 600, kind: "town" },
+  { name: "Osgiliath",        x: 662, y: 590, kind: "ruin" },
+  { name: "Pelargir",         x: 648, y: 660, kind: "town" },
+  { name: "Dol Amroth",       x: 560, y: 660, kind: "town" },
+  { name: "Minas Morgul",     x: 700, y: 562, kind: "tower" },
+  { name: "Barad-dûr",        x: 802, y: 520, kind: "tower" },
+  { name: "Mount Doom",       x: 762, y: 540, kind: "volcano" },
+  { name: "Cirith Ungol",     x: 712, y: 548, kind: "fort" },
+
+  // --- Shire & Eriador ---
+  { name: "Bywater",          x: 274, y: 302, kind: "town" },
+  { name: "Tuckborough",      x: 248, y: 318, kind: "town" },
+  { name: "Buckland",         x: 352, y: 308, kind: "town" },
+  { name: "Brandywine Bridge",x: 344, y: 300, kind: "landmark" },
+  { name: "Sarn Ford",        x: 306, y: 362, kind: "landmark" },
+  { name: "Amon Sûl (Weathertop)", x: 410, y: 282, kind: "ruin" },
+  { name: "Tower Hills (Emyn Beraid)", x: 150, y: 268, kind: "tower" },
+  { name: "Lond Daer",        x: 206, y: 408, kind: "ruin" },
+  // --- The North ---
+  { name: "Carn Dûm",         x: 360, y: 52,  kind: "tower" },
+  { name: "Framsburg",        x: 560, y: 110, kind: "ruin" },
+  // --- Misty Mountains & Anduin vales ---
+  { name: "Moria (Khazad-dûm)", x: 506, y: 300, kind: "ruin" },
+  { name: "Caras Galadhon",   x: 560, y: 382, kind: "town" },
+  { name: "Old Ford",         x: 580, y: 300, kind: "landmark" },
+  // --- Mirkwood & the East ---
+  { name: "Thranduil's Halls",x: 700, y: 156, kind: "fort" },
+  // --- Rohan ---
+  { name: "Aldburg",          x: 540, y: 548, kind: "town" },
+  { name: "Dunharrow",        x: 492, y: 558, kind: "fort" },
+  { name: "Fords of Isen",    x: 460, y: 506, kind: "landmark" },
+  // --- Gondor: Anduin & Nen Hithoel ---
+  { name: "Argonath",         x: 600, y: 478, kind: "landmark" },
+  { name: "Amon Hen",         x: 586, y: 500, kind: "landmark" },
+  { name: "Amon Lhaw",        x: 614, y: 500, kind: "landmark" },
+  { name: "Rauros",           x: 601, y: 512, kind: "landmark" },
+  { name: "Cair Andros",      x: 646, y: 576, kind: "landmark" },
+  { name: "Henneth Annûn",    x: 686, y: 574, kind: "fort" },
+  // --- Gondor: Lebennin & Belfalas ---
+  { name: "Linhir",           x: 560, y: 648, kind: "town" },
+  { name: "Ethring",          x: 522, y: 636, kind: "town" },
+  { name: "Calembel",         x: 492, y: 620, kind: "town" },
+  { name: "Edhellond",        x: 548, y: 668, kind: "haven" },
+  // --- Mordor ---
+  { name: "Morannon (Black Gate)", x: 700, y: 462, kind: "tower" },
+  { name: "Durthang",         x: 716, y: 502, kind: "tower" },
+  { name: "Isenmouthe",       x: 730, y: 488, kind: "landmark" },
+  // --- Far South ---
+  { name: "Umbar",            x: 742, y: 756, kind: "haven" },
+];
+
+// Region labels (no marker, just large spaced text)
+const regionLabels = [
+  { name: "MORDOR",    x: 770, y: 500 },
+  { name: "ROHAN",     x: 500, y: 498 },
+  { name: "GONDOR",    x: 660, y: 632 },
+  { name: "RHOVANION", x: 600, y: 430 },
+  { name: "ERIADOR",   x: 320, y: 380 },
+  { name: "LINDON",    x: 150, y: 300 },
+  { name: "RHÛN",      x: 900, y: 300 },
+  { name: "FORODWAITH",x: 540, y: 36  },
+  { name: "HARAD",     x: 720, y: 730 },
+  { name: "THE SHIRE", x: 286, y: 286 },
+  { name: "ANGMAR",    x: 360, y: 90  },
+  { name: "MINHIRIATH",x: 300, y: 430 },
+  { name: "ENEDWAITH", x: 380, y: 500 },
+  { name: "DUNLAND",   x: 436, y: 452 },
+  { name: "EREGION",   x: 466, y: 332 },
+  { name: "ANÓRIEN",   x: 596, y: 558 },
+  { name: "LEBENNIN",  x: 556, y: 628 },
+  { name: "ITHILIEN",  x: 700, y: 640 },
+  { name: "DAGORLAD",  x: 660, y: 458 },
+  { name: "THE WOLD",  x: 548, y: 452 },
+  { name: "NURN",      x: 800, y: 648 },
+];
+
+/* =====================================================================
+   CAMERA + CANVAS RENDERER
+   ===================================================================== */
+
+const canvas = document.getElementById("map");
+const ctx = canvas.getContext("2d");
+const readout = document.getElementById("readout");
+
+const cam = { x: WORLD.w / 2, y: WORLD.h / 2, scale: 1 };
+let dpr = 1, viewW = 0, viewH = 0;
+let showCaptions = true, showGrid = true, showContours = true;
+const MIN_SCALE = 0.2, MAX_SCALE = 12;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  viewW = window.innerWidth;  viewH = window.innerHeight;
+  canvas.width = Math.round(viewW * dpr);
+  canvas.height = Math.round(viewH * dpr);
+  canvas.style.width = viewW + "px";  canvas.style.height = viewH + "px";
+  requestDraw();
+}
+
+function sx(x){ return (x - cam.x) * cam.scale + viewW/2; }
+function sy(y){ return (y - cam.y) * cam.scale + viewH/2; }
+function wx(p){ return (p - viewW/2)/cam.scale + cam.x; }
+function wy(p){ return (p - viewH/2)/cam.scale + cam.y; }
+
+function fitView() {
+  const pad = 40;
+  cam.scale = Math.min((viewW - pad)/WORLD.w, (viewH - pad)/WORLD.h);
+  cam.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, cam.scale));
+  cam.x = WORLD.w/2;  cam.y = WORLD.h/2;
+  requestDraw();
+}
+
+function hash(i){ const s = Math.sin(i*127.1)*43758.5453; return s - Math.floor(s); }
+
+function tracePoly(pts){
+  ctx.beginPath();
+  ctx.moveTo(sx(pts[0][0]), sy(pts[0][1]));
+  for (let i=1;i<pts.length;i++) ctx.lineTo(sx(pts[i][0]), sy(pts[i][1]));
+}
+
+/* ---- captions / labels ---- */
+// Plain horizontal caption with halo, fixed screen size.
+function caption(text, X, Y, color, font, align){
+  ctx.font = font; ctx.textAlign = align || "center"; ctx.textBaseline = "middle";
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(244,236,214,.92)";
+  ctx.strokeText(text, X, Y);
+  ctx.fillStyle = color; ctx.fillText(text, X, Y);
+}
+// Caption rotated to follow a polyline's middle segment.
+function captionAlong(path, text, color, font){
+  const i = Math.max(0, Math.floor(path.length/2) - 1);
+  const a = path[i], b = path[i+1] || path[i];
+  const mx = (a[0]+b[0])/2, my = (a[1]+b[1])/2;
+  let ang = Math.atan2(sy(b[1])-sy(a[1]), sx(b[0])-sx(a[0]));
+  if (ang > Math.PI/2) ang -= Math.PI; if (ang < -Math.PI/2) ang += Math.PI;
+  ctx.save();
+  ctx.translate(sx(mx), sy(my)); ctx.rotate(ang);
+  caption(text, 0, -7, color, font, "center");
+  ctx.restore();
+}
+
+/* ---- feature drawing ---- */
+function drawWater(){
+  for (const w of waterBodies){
+    tracePoly(w.poly); ctx.closePath();
+    ctx.fillStyle = "#9ec5d8"; ctx.fill();
+    ctx.lineWidth = Math.max(1, 1.2*cam.scale); ctx.strokeStyle = "#5f93ad"; ctx.stroke();
+  }
+}
+function drawForests(){
+  for (const f of forests){
+    tracePoly(f.poly); ctx.closePath();
+    ctx.fillStyle = "#8aa86b"; ctx.fill();
+    ctx.lineWidth = Math.max(1, cam.scale); ctx.strokeStyle = "#5e7d46"; ctx.stroke();
+  }
+}
+function drawHills(){
+  for (const h of hills){
+    tracePoly(h.poly); ctx.closePath();
+    ctx.fillStyle = "#cdbf94"; ctx.fill();
+    ctx.lineWidth = Math.max(1, cam.scale); ctx.strokeStyle = "#9c8a5e"; ctx.stroke();
+  }
+}
+function drawRivers(){
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  for (const r of rivers){
+    tracePoly(r.path);
+    ctx.lineWidth = Math.max(1.2, r.width*cam.scale); ctx.strokeStyle = "#5f93ad"; ctx.stroke();
+  }
+}
+function drawRoads(){
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  for (const rd of roads){
+    tracePoly(rd.path);
+    ctx.setLineDash([8,6]);
+    ctx.lineWidth = Math.max(1.5, 2.4*Math.sqrt(cam.scale)); ctx.strokeStyle = "#a77b3e"; ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+function drawPlaces(){
+  for (const p of places){
+    const X=sx(p.x), Y=sy(p.y);
+    if (X<-60||X>viewW+60||Y<-40||Y>viewH+40) continue;
+    drawMarker(X,Y,p.kind);
+    if (showCaptions) caption(p.name, X+9, Y, "#2c2110", "13px Georgia, serif", "left");
+  }
+}
+function drawMarker(X,Y,kind){
+  ctx.lineWidth=1.4;
+  if (kind==="volcano"){
+    ctx.beginPath(); ctx.moveTo(X,Y-8); ctx.lineTo(X-7,Y+5); ctx.lineTo(X+7,Y+5); ctx.closePath();
+    ctx.fillStyle="#a83a2a"; ctx.fill(); ctx.strokeStyle="#5e1b12"; ctx.stroke();
+  } else if (kind==="tower"){
+    ctx.fillStyle="#3a2c12"; ctx.fillRect(X-3,Y-6,6,12); ctx.strokeStyle="#1d1607"; ctx.strokeRect(X-3,Y-6,6,12);
+  } else if (kind==="fort"||kind==="ruin"){
+    ctx.fillStyle = kind==="ruin"?"#8a7a5c":"#5b4a2a"; ctx.fillRect(X-5,Y-4,10,8);
+    ctx.strokeStyle="#2c2110"; ctx.strokeRect(X-5,Y-4,10,8);
+  } else if (kind==="haven"){
+    // anchor-blue diamond for ports / elven havens
+    ctx.beginPath(); ctx.moveTo(X,Y-6); ctx.lineTo(X+6,Y); ctx.lineTo(X,Y+6); ctx.lineTo(X-6,Y); ctx.closePath();
+    ctx.fillStyle="#3f7fa0"; ctx.fill(); ctx.strokeStyle="#274e63"; ctx.stroke();
+  } else if (kind==="landmark"){
+    // small hollow ring with a centre dot for natural landmarks / crossings
+    ctx.beginPath(); ctx.arc(X,Y,4.5,0,Math.PI*2); ctx.fillStyle="rgba(244,236,214,.9)"; ctx.fill();
+    ctx.strokeStyle="#5a3c1a"; ctx.stroke();
+    ctx.beginPath(); ctx.arc(X,Y,1.4,0,Math.PI*2); ctx.fillStyle="#5a3c1a"; ctx.fill();
+  } else {
+    ctx.beginPath(); ctx.arc(X,Y,5,0,Math.PI*2); ctx.fillStyle="#7a2f1c"; ctx.fill();
+    ctx.strokeStyle="#3a160c"; ctx.stroke();
+  }
+}
+
+// Cosmetic small lakes/tarns (overlay; no elevation effect).
+function drawLakes(){
+  for (const l of lakes){
+    tracePoly(l.poly); ctx.closePath();
+    ctx.fillStyle = "#9ec5d8"; ctx.fill();
+    ctx.lineWidth = Math.max(1, 1.1*cam.scale); ctx.strokeStyle = "#5f93ad"; ctx.stroke();
+  }
+}
+// Marshes/fens: pale wash plus a scatter of reed ticks and a dashed rim.
+function drawMarshes(){
+  for (const mh of marshes){
+    tracePoly(mh.poly); ctx.closePath();
+    ctx.fillStyle = "rgba(150,178,150,.45)"; ctx.fill();
+    ctx.setLineDash([3,3]); ctx.lineWidth = 1; ctx.strokeStyle = "rgba(74,96,74,.7)"; ctx.stroke();
+    ctx.setLineDash([]);
+    // reed ticks: short vertical strokes seeded from the polygon vertices
+    const c = centroid(mh.poly);
+    ctx.strokeStyle = "rgba(60,86,60,.65)"; ctx.lineWidth = 1;
+    for (let i=0;i<mh.poly.length;i++){
+      const px = (mh.poly[i][0]*2 + c[0])/3, py = (mh.poly[i][1]*2 + c[1])/3;
+      const X=sx(px), Y=sy(py), h=Math.max(2,2.2*cam.scale);
+      ctx.beginPath(); ctx.moveTo(X,Y); ctx.lineTo(X,Y-h); ctx.stroke();
+    }
+  }
+}
+
+// Named summits: a dark peak glyph with a white snow cap, plus a bold label.
+function drawPeaks(){
+  for (const p of peaks){
+    const X=sx(p.x), Y=sy(p.y);
+    if (X<-40||X>viewW+40||Y<-30||Y>viewH+30) continue;
+    ctx.beginPath(); ctx.moveTo(X,Y-10); ctx.lineTo(X-8,Y+5); ctx.lineTo(X+8,Y+5); ctx.closePath();
+    ctx.fillStyle="#6b5d3e"; ctx.fill(); ctx.lineWidth=1; ctx.strokeStyle="#33260f"; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(X,Y-10); ctx.lineTo(X-4,Y-1.5); ctx.lineTo(X+4,Y-1.5); ctx.closePath();
+    ctx.fillStyle="#fff"; ctx.fill();
+    if (showCaptions){
+      const txt = (p.note ? p.name+" ("+p.note+")" : p.name) + "  ·  " + p._m + " m";
+      caption(txt, X, Y-15, "#2c2110", "bold 12px Georgia, serif", "center");
+    }
+  }
+}
+
+function drawCaptions(){
+  if (!showCaptions) return;
+  // regions (always, large, spaced)
+  for (const r of regionLabels)
+    caption(r.name.split("").join(" "), sx(r.x), sy(r.y),
+            "rgba(74,59,30,.5)", "italic 22px 'Palatino Linotype', serif", "center");
+  // feature captions appear once you zoom in a little (reduces clutter)
+  if (cam.scale < 0.55) return;
+  for (const w of waterBodies)
+    caption(w.name, sx(w.lx), sy(w.ly), "#2f6076", "italic 13px Georgia, serif", "center");
+  for (const l of lakes)
+    caption(l.name, sx(l.lx), sy(l.ly), "#2f6076", "italic 11px Georgia, serif", "center");
+  for (const mh of marshes)
+    caption(mh.name, sx(mh.lx), sy(mh.ly), "#3f5a3f", "italic 11px Georgia, serif", "center");
+  for (const f of forests)
+    caption(f.name, sx(f.lx), sy(f.ly), "#3c5a2a", "italic 12px Georgia, serif", "center");
+  for (const m of mountainRanges)
+    caption(m.name, sx(m.lx), sy(m.ly), "#5b4a2a", "italic 12px Georgia, serif", "center");
+  for (const h of hills){
+    const c = centroid(h.poly);
+    caption(h.name, sx(c[0]), sy(c[1]), "#6e5a2e", "italic 11px Georgia, serif", "center");
+  }
+  for (const r of rivers)  captionAlong(r.path, r.name, "#2f6076", "italic 15px Georgia, serif");
+  for (const rd of roads)  captionAlong(rd.path, rd.name, "#7a5520", "11px Georgia, serif");
+  for (const p of passes)  caption("›‹ " + p.name, sx(p.x), sy(p.y), "#5a3c1a", "italic 11px Georgia, serif", "center");
+}
+
+function centroid(poly){
+  let x=0,y=0; for (const p of poly){x+=p[0]; y+=p[1];}
+  return [x/poly.length, y/poly.length];
+}
+
+function drawFrame(){
+  ctx.lineWidth=2; ctx.strokeStyle="#8a7a52";
+  ctx.strokeRect(sx(0), sy(0), WORLD.w*cam.scale, WORLD.h*cam.scale);
+}
+
+/* =====================================================================
+   ELEVATION FIELD + CONTOUR LINES
+   A synthetic height field is built from the terrain features: each
+   mountain peak and hill contributes a radial bump; water bodies push
+   the surface below sea level. Contours are then traced once in world
+   space with marching squares and merely re-projected every frame.
+   ===================================================================== */
+
+// Mountain passes: low gaps carved into a ridge so a road can cross
+// without going over the peaks. Each notches the crest down locally.
+const passes = [
+  { name: "High Pass",     x: 504, y: 302, depth: 0.80, r: 18 },  // Misty Mtns, Great East Road
+  { name: "Gap of Rohan",  x: 470, y: 500, depth: 0.30, r: 22 },  // between Misty Mtns & Ered Nimrais
+  { name: "Redhorn Pass",  x: 508, y: 258, depth: 0.55, r: 14 },  // Caradhras, above Moria
+  { name: "Cirith Ungol",  x: 708, y: 552, depth: 0.45, r: 11 },  // pass over the Ephel Dúath
+];
+const MTN_WIDTH = 20;     // ridge half-width (sigma) in world units
+
+// Named summits. Each raises a distinct, snow-capped peak above the
+// surrounding ridge; the bigger the amp, the higher (and snowier) it is.
+const peaks = [
+  { name: "Caradhras",    x: 506, y: 232, amp: 1.05, r: 13 },
+  { name: "Celebdil",     x: 516, y: 248, amp: 1.00, r: 12 },
+  { name: "Fanuidhol",    x: 527, y: 256, amp: 0.95, r: 12 },
+  { name: "Thangorodrim", x: 440, y: 32,  amp: 1.20, r: 16, note: "First Age" },
+  { name: "Erebor",       x: 730, y: 176, amp: 0.78, r: 9,  note: "Lonely Mtn" },
+  { name: "Gundabad",     x: 545, y: 72,  amp: 0.95, r: 14 },
+  { name: "Mindolluin",   x: 628, y: 600, amp: 0.92, r: 13 },
+  { name: "Methedras",    x: 502, y: 420, amp: 0.90, r: 12 },
+  { name: "Dwimorberg",   x: 492, y: 566, amp: 0.82, r: 11, note: "Haunted Mtn" },
+  { name: "Halifirien",   x: 558, y: 524, amp: 0.70, r: 10 },
+];
+
+// distance from a point to a polyline (min over its segments)
+function distSeg(px,py,x1,y1,x2,y2){
+  const dx=x2-x1, dy=y2-y1, l2=dx*dx+dy*dy;
+  let t = l2 ? ((px-x1)*dx+(py-y1)*dy)/l2 : 0;
+  t = t<0?0:t>1?1:t;
+  return Math.hypot(px-(x1+t*dx), py-(y1+t*dy));
+}
+function distToRidge(px,py,pts){
+  let best=Infinity;
+  for (let i=0;i<pts.length-1;i++){
+    const d=distSeg(px,py,pts[i][0],pts[i][1],pts[i+1][0],pts[i+1][1]);
+    if(d<best)best=d;
+  }
+  return best;
+}
+
+// point-in-polygon (ray casting) — used for the sea mask
+function pointInPoly(px,py,poly){
+  let inside=false;
+  for (let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const xi=poly[i][0],yi=poly[i][1],xj=poly[j][0],yj=poly[j][1];
+    if (((yi>py)!==(yj>py)) && (px < (xj-xi)*(py-yi)/((yj-yi)||1e-9)+xi)) inside=!inside;
+  }
+  return inside;
+}
+
+// One-time setup: hill centroids and per-peak summit heights.
+function buildElevation(){
+  for (const h of hills) h._c = centroid(h.poly);
+  for (const p of peaks) p._m = fieldToM(baseElevation(p.x,p.y));
+}
+
+// Continuous BASE elevation field (calibrated field units), before rivers.
+//   - inside any water body -> sea floor (a true local minimum)
+//   - on land -> a gently ROLLING regional surface (no dead-flat sea-level
+//     plains), with mountain ridges, named peaks and carved passes on top.
+function baseElevation(x,y){
+  for (const w of waterBodies) if (pointInPoly(x,y,w.poly)) return -0.06;
+
+  // regional rolling relief: long-wavelength swells so the lowlands rise and
+  // fall gently (~0–800 m) and contour lines are spread across the whole land.
+  let e = 0.20
+        + 0.045*Math.sin(x*0.010 + 0.7)
+        + 0.032*Math.cos(y*0.012 + 1.9)
+        + 0.024*Math.sin((x+y)*0.0065 + 2.4);
+  // fine detail
+  e += 0.006*Math.sin(x*0.13 + y*0.07)
+     + 0.004*Math.cos(x*0.05 - y*0.11)
+     + 0.003*Math.sin(x*0.31 + y*0.23);
+  // mountains: highest ridge wins; named summits rise above
+  let mtn = 0;
+  for (const m of mountainRanges){
+    const d = distToRidge(x,y,m.ridge);
+    const h = m.scale * Math.exp(-(d*d)/(2*MTN_WIDTH*MTN_WIDTH));
+    if (h>mtn) mtn=h;
+  }
+  for (const p of peaks){
+    const dx=x-p.x, dy=y-p.y;
+    const h = p.amp*Math.exp(-(dx*dx+dy*dy)/(2*p.r*p.r));
+    if (h>mtn) mtn=h;
+  }
+  for (const p of passes){
+    const dx=x-p.x, dy=y-p.y;
+    mtn -= p.depth*Math.exp(-(dx*dx+dy*dy)/(2*p.r*p.r));
+  }
+  if (mtn>0) e += mtn;
+  // hills
+  for (const hh of hills){
+    const dx=x-hh._c[0], dy=y-hh._c[1];
+    e += 0.18*Math.exp(-(dx*dx+dy*dy)/(2*38*38));
+  }
+  return e;
+}
+
+/* =====================================================================
+   RIVER VALLEYS — making rivers honour the contours
+   For each river we carve a symmetric V-valley into the field along its
+   smoothed course. Two properties follow purely from the geometry:
+     • Symmetry about the course  =>  on the course the cross-stream slope
+       cancels, so the gradient points straight downstream. A river that
+       runs down the gradient crosses every contour (a level set, ⟂ to the
+       gradient) at 90°.
+     • A monotone valley-floor profile  =>  the river never flows uphill.
+   The floor profile is built as a running minimum of the local terrain
+   (so it always sits below ground and is non-increasing toward the mouth),
+   clamped to sea level, with tributaries kept just above their trunk so
+   they descend INTO it instead of trenching through it.
+   ===================================================================== */
+const RV_MARGIN = 0.04;     // channel depth below local ground (~156 m)
+const RV_C      = 0.008;    // valley wall slope (field units per world unit)
+const RV_SEAFLR = -0.06;    // channels bottom out at lake/sea level
+const RV_DELTA  = 0.012;    // a tributary stays this far above its trunk
+
+function rvResample(pts, ds){
+  const out=[pts[0].slice()];
+  for (let i=0;i<pts.length-1;i++){
+    const x1=pts[i][0],y1=pts[i][1],x2=pts[i+1][0],y2=pts[i+1][1];
+    const seg=Math.hypot(x2-x1,y2-y1), n=Math.max(1,Math.floor(seg/ds));
+    for (let k=1;k<=n;k++){ const t=k/n; out.push([x1+(x2-x1)*t, y1+(y2-y1)*t]); }
+  }
+  return out;
+}
+function rvSmooth(pts, iters){
+  let p=pts.map(q=>q.slice());
+  for (let it=0; it<iters; it++){
+    const q=[p[0]];
+    for (let i=1;i<p.length-1;i++)
+      q.push([(p[i-1][0]+2*p[i][0]+p[i+1][0])/4, (p[i-1][1]+2*p[i][1]+p[i+1][1])/4]);
+    q.push(p[p.length-1]); p=q;
+  }
+  return p;
+}
+function rvArclen(pts){
+  const s=[0];
+  for (let i=1;i<pts.length;i++) s.push(s[i-1]+Math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1]));
+  return s;
+}
+// nearest point on a river's polyline -> {d: distance, s: arclength there}
+function rvNearest(r,px,py){
+  const pts=r.path, S=r._s; let best=Infinity, bs=0;
+  for (let i=0;i<pts.length-1;i++){
+    const x1=pts[i][0],y1=pts[i][1],x2=pts[i+1][0],y2=pts[i+1][1];
+    const dx=x2-x1,dy=y2-y1,l2=dx*dx+dy*dy;
+    let t = l2 ? ((px-x1)*dx+(py-y1)*dy)/l2 : 0; t = t<0?0:t>1?1:t;
+    const cx=x1+t*dx, cy=y1+t*dy, d=Math.hypot(px-cx,py-cy);
+    if (d<best){ best=d; bs=S[i]+t*Math.hypot(dx,dy); }
+  }
+  return {d:best, s:bs};
+}
+function rvFloorAt(r,s){
+  const S=r._s, fl=r._floor;
+  if (s<=S[0]) return fl[0];
+  if (s>=S[S.length-1]) return fl[fl.length-1];
+  let lo=0, hi=S.length-1;
+  while (hi-lo>1){ const m=(lo+hi)>>1; if (S[m]<s) lo=m; else hi=m; }
+  const t=(S[hi]>S[lo])?(s-S[lo])/(S[hi]-S[lo]):0;
+  return fl[lo]+(fl[hi]-fl[lo])*t;
+}
+
+let riversReady = false;
+// One-time: smooth every river, then build a monotone sub-terrain floor.
+// Trunks must be built before the tributaries that reference them.
+function buildRivers(){
+  const byName={};
+  for (const r of rivers){
+    r.path = rvSmooth(rvResample(r.route, 5), 2);
+    r._s   = rvArclen(r.path);
+    byName[r.name]=r;
+  }
+  const ordered = rivers.slice().sort((a,b)=> (a.trunk?1:0)-(b.trunk?1:0)); // trunks first
+  for (const r of ordered){
+    const pts=r.path, n=pts.length;
+    const b=pts.map(p=>baseElevation(p[0],p[1]));
+    // running minimum of (ground - margin): below ground and non-increasing
+    const env=new Array(n); let run=Infinity;
+    for (let i=0;i<n;i++){ run=Math.min(run, b[i]-RV_MARGIN); env[i]=run; }
+    let capv=RV_SEAFLR;
+    if (r.trunk && byName[r.trunk]){
+      const tr=byName[r.trunk], nr=rvNearest(tr, pts[n-1][0], pts[n-1][1]);
+      capv = rvFloorAt(tr, nr.s) + RV_DELTA;       // sit just above the trunk
+    }
+    const floor=new Array(n);
+    for (let i=0;i<n;i++) floor[i]=Math.max(env[i], capv);
+    // keep the channel below ground but never below sea level
+    for (let i=0;i<n;i++) floor[i]=Math.min(floor[i], Math.max(b[i]-RV_MARGIN, RV_SEAFLR));
+    // enforce non-increasing toward the mouth by lowering only (never uphill)
+    for (let i=1;i<n;i++) floor[i]=Math.min(floor[i], floor[i-1]);
+    r._floor=floor;
+  }
+  riversReady=true;
+}
+
+// Final elevation field: the base terrain with river valleys carved in.
+// This is what the contour tracer and relief shading sample.
+//
+// Each land point is assigned to its SINGLE nearest river and lies in that
+// river's V-valley alone. Letting only one valley act per point (rather than
+// blending several) keeps every cross-section symmetric, so the gradient on a
+// channel points straight downstream — which is exactly what makes each river
+// monotonic (never uphill) and square to the contours. Where two valleys meet,
+// a drainage divide (ridge) falls naturally on the line equidistant between them.
+function elevation(x,y){
+  const e = baseElevation(x,y);
+  if (!riversReady || e <= -0.05) return e;        // inside a water body: leave it
+  let bestd=Infinity, br=null, bs=0;
+  for (const r of rivers){
+    const nr=rvNearest(r,x,y);
+    if (nr.d<bestd){ bestd=nr.d; br=r; bs=nr.s; }
+  }
+  const T = rvFloorAt(br,bs) + RV_C*bestd;          // V-valley wall rising with distance
+  return T<e ? T : e;
+}
+
+// Shared elevation grid, sampled once, used by BOTH the relief fill and
+// the contour tracer.
+let TER = null;
+function buildTerrain(){
+  const step = 4;   // fine enough to resolve the carved river valleys
+  const nx = Math.floor(WORLD.w/step), ny = Math.floor(WORLD.h/step);
+  const V = [];
+  for (let i=0;i<=nx;i++){ V[i]=[]; for (let j=0;j<=ny;j++) V[i][j]=elevation(i*step, j*step); }
+  TER = { step, nx, ny, V };
+}
+
+// ---- Elevation calibration: field value -> real metres ---------------
+// Field ~0.10 is sea level; Caradhras (~1.26) ≈ 4500 m  ->  ~3900 m / unit.
+const SEA_E = 0.10;                 // field value at sea level (0 m)
+const M_PER_UNIT = 3900;            // metres per field unit
+const CONTOUR_INTERVAL_M = 100;     // a contour line every 100 m
+const INDEX_EVERY_M = 500;          // bold, labelled line every 500 m
+const SNOW_M = 3500;                // permanent snow above ~3500 m
+const mToField = m => SEA_E + m/M_PER_UNIT;
+const fieldToM = e => Math.round((e-SEA_E)*M_PER_UNIT);
+const SNOW_LEVEL = mToField(SNOW_M);
+
+// Marching-squares iso-line tracing at every 100 m from sea level up.
+const contours = [];   // [{ meters, level, index, segs:[[x1,y1,x2,y2],...] }]
+function buildContours(){
+  const {step,nx,ny,V} = TER;
+  let maxE=-Infinity;
+  for (let i=0;i<=nx;i++) for (let j=0;j<=ny;j++) if(V[i][j]>maxE) maxE=V[i][j];
+  const maxM = (maxE-SEA_E)*M_PER_UNIT;
+  const lerp=(a,b,L)=> (L-a)/(b-a);
+  for (let m=CONTOUR_INTERVAL_M; m<=maxM; m+=CONTOUR_INTERVAL_M){
+    const level = mToField(m);
+    const segs=[];
+    for (let i=0;i<nx;i++) for (let j=0;j<ny;j++){
+      const x0=i*step, y0=j*step, x1=x0+step, y1=y0+step;
+      const tl=V[i][j], tr=V[i+1][j], br=V[i+1][j+1], bl=V[i][j+1];
+      let c=0; if(tl>level)c|=8; if(tr>level)c|=4; if(br>level)c|=2; if(bl>level)c|=1;
+      if(c===0||c===15) continue;
+      const T=[x0+step*lerp(tl,tr,level), y0];
+      const R=[x1, y0+step*lerp(tr,br,level)];
+      const B=[x0+step*lerp(bl,br,level), y1];
+      const Lf=[x0, y0+step*lerp(tl,bl,level)];
+      const push=(a,b)=>segs.push([a[0],a[1],b[0],b[1]]);
+      switch(c){
+        case 1: case 14: push(Lf,B); break;
+        case 2: case 13: push(B,R);  break;
+        case 3: case 12: push(Lf,R); break;
+        case 4: case 11: push(T,R);  break;
+        case 5:          push(Lf,T); push(B,R); break;
+        case 6: case 9:  push(T,B);  break;
+        case 7: case 8:  push(Lf,T); break;
+        case 10:         push(T,R);  push(Lf,B); break;
+      }
+    }
+    contours.push({ meters:m, level, index:(m % INDEX_EVERY_M === 0), segs });
+  }
+}
+
+// Hypsometric colour ramp (low -> high). Returns null below the lowest
+// stop so the lowlands keep the parchment background.
+const RELIEF_MIN = 0.36;
+const RAMP = [
+  [0.36,[206,191,150]], [0.50,[184,162,114]], [0.64,[158,135,90]],
+  [0.80,[140,122,98]],  [0.95,[160,150,134]], [1.02,[205,201,194]],
+  [1.10,[240,239,236]], [1.20,[255,255,255]]   // white only at the very top
+];
+function reliefColor(e){
+  if (e < RELIEF_MIN) return null;
+  let a=RAMP[0], b=RAMP[RAMP.length-1];
+  for (let i=0;i<RAMP.length-1;i++){ if (e>=RAMP[i][0] && e<=RAMP[i+1][0]){ a=RAMP[i]; b=RAMP[i+1]; break; } }
+  const t=(e-a[0])/((b[0]-a[0])||1);
+  const r=Math.round(a[1][0]+(b[1][0]-a[1][0])*t);
+  const g=Math.round(a[1][1]+(b[1][1]-a[1][1])*t);
+  const bl=Math.round(a[1][2]+(b[1][2]-a[1][2])*t);
+  return "rgb("+r+","+g+","+bl+")";
+}
+
+// Filled hypsometric relief with snow caps — replaces the symbolic peaks.
+function drawRelief(){
+  const {step,nx,ny,V}=TER;
+  const w = step*cam.scale + 1.2;            // +overlap to avoid seams
+  for (let i=0;i<nx;i++) for (let j=0;j<ny;j++){
+    const e=(V[i][j]+V[i+1][j]+V[i][j+1]+V[i+1][j+1])*0.25;
+    const col=reliefColor(e); if(!col) continue;
+    const X=sx(i*step), Y=sy(j*step);
+    if (X<-w||X>viewW||Y<-w||Y>viewH) continue;   // viewport cull
+    ctx.fillStyle=col; ctx.fillRect(X,Y,w,w);
+  }
+}
+
+function drawContours(){
+  if(!showContours) return;
+  ctx.lineCap="round";
+  for (const c of contours){
+    ctx.beginPath();
+    for (const s of c.segs){ ctx.moveTo(sx(s[0]),sy(s[1])); ctx.lineTo(sx(s[2]),sy(s[3])); }
+    if (c.level >= SNOW_LEVEL){            // contours on the snow read white
+      ctx.lineWidth = c.index ? 1.0 : 0.6; ctx.strokeStyle = "rgba(255,255,255,.85)";
+    } else if (c.index){                   // bold "index" contour every 500 m
+      ctx.lineWidth = 1.2; ctx.strokeStyle = "rgba(96,72,38,.60)";
+    } else {                               // ordinary 100 m contour
+      ctx.lineWidth = 0.55; ctx.strokeStyle = "rgba(96,72,38,.30)";
+    }
+    ctx.stroke();
+  }
+  if (cam.scale >= 0.45) drawContourLabels();   // labels only when readable
+}
+
+// Elevation labels along the index (every-500 m) contours.
+function drawContourLabels(){
+  for (const c of contours){
+    if (!c.index || c.segs.length===0) continue;
+    const white = c.level >= SNOW_LEVEL;
+    const col = white ? "#41525a" : "#5b4326";
+    const gap = Math.max(16, Math.floor(c.segs.length/4));   // ~4 labels per level
+    for (let k=Math.floor(gap/2); k<c.segs.length; k+=gap){
+      const s=c.segs[k];
+      const X0=sx(s[0]),Y0=sy(s[1]),X1=sx(s[2]),Y1=sy(s[3]);
+      if (X0<10||X0>viewW-10||Y0<10||Y0>viewH-10) continue;
+      let ang=Math.atan2(Y1-Y0,X1-X0);
+      if(ang>Math.PI/2)ang-=Math.PI; if(ang<-Math.PI/2)ang+=Math.PI;
+      ctx.save();
+      ctx.translate((X0+X1)/2,(Y0+Y1)/2); ctx.rotate(ang);
+      caption(c.meters+" m", 0, 0, col, "10px monospace", "center");
+      ctx.restore();
+    }
+  }
+}
+
+/* ---- coordinate graticule -------------------------------------------
+   Adaptive spacing: pick a step whose on-screen size is comfortable. */
+function gridStep(){
+  const target = 90;                          // desired px between lines
+  const candidates = [10,25,50,100,200,500];
+  for (const c of candidates) if (c*cam.scale >= target) return c;
+  return 500;
+}
+function drawGrid(){
+  if(!showGrid) return;
+  const g = gridStep();
+  ctx.lineWidth = 1; ctx.strokeStyle = "rgba(90,74,42,.22)";
+  ctx.font = "11px monospace"; ctx.fillStyle = "rgba(74,59,30,.85)";
+  ctx.textBaseline = "top"; ctx.textAlign = "left";
+  const x0=sx(0), y0=sy(0), x1=sx(WORLD.w), y1=sy(WORLD.h);
+  // vertical lines (constant x)
+  for (let x=0; x<=WORLD.w+0.1; x+=g){
+    const X=sx(x);
+    ctx.beginPath(); ctx.moveTo(X, Math.max(y0,0)); ctx.lineTo(X, Math.min(y1,viewH)); ctx.stroke();
+    const ly = Math.min(Math.max(y0,2), viewH-14);
+    ctx.fillText("x"+x, X+3, ly);
+  }
+  // horizontal lines (constant y)
+  ctx.textBaseline = "bottom";
+  for (let y=0; y<=WORLD.h+0.1; y+=g){
+    const Y=sy(y);
+    ctx.beginPath(); ctx.moveTo(Math.max(x0,0), Y); ctx.lineTo(Math.min(x1,viewW), Y); ctx.stroke();
+    const lx = Math.min(Math.max(x0,2), viewW-40);
+    ctx.fillText("y"+y, lx+3, Y-2);
+  }
+}
+
+/* ---- main draw ---- */
+let drawQueued=false;
+function requestDraw(){ if(drawQueued) return; drawQueued=true; requestAnimationFrame(draw); }
+function draw(){
+  drawQueued=false;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,viewW,viewH);
+  ctx.fillStyle="#efe6cf";
+  ctx.fillRect(sx(0), sy(0), WORLD.w*cam.scale, WORLD.h*cam.scale);
+
+  drawWater(); drawForests(); drawHills();
+  drawRelief(); drawContours();
+  drawRivers(); drawMarshes(); drawLakes();
+  drawRoads(); drawGrid(); drawPlaces(); drawPeaks(); drawCaptions(); drawFrame();
+
+  readout.textContent = "zoom ×" + cam.scale.toFixed(2);
+}
+
+/* =====================================================================
+   INTERACTION
+   ===================================================================== */
+let dragging=false, lastX=0, lastY=0;
+canvas.addEventListener("pointerdown", e=>{
+  dragging=true; lastX=e.clientX; lastY=e.clientY;
+  canvas.classList.add("dragging"); canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointermove", e=>{
+  readout.textContent = "x "+wx(e.clientX).toFixed(0)+"  y "+wy(e.clientY).toFixed(0)+"   zoom ×"+cam.scale.toFixed(2);
+  if(!dragging) return;
+  cam.x -= (e.clientX-lastX)/cam.scale; cam.y -= (e.clientY-lastY)/cam.scale;
+  lastX=e.clientX; lastY=e.clientY; requestDraw();
+});
+function endDrag(){ dragging=false; canvas.classList.remove("dragging"); }
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+
+canvas.addEventListener("wheel", e=>{
+  e.preventDefault(); zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY*0.0015));
+}, { passive:false });
+
+function zoomAt(px,py,factor){
+  const bx=wx(px), by=wy(py);
+  cam.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, cam.scale*factor));
+  cam.x += bx - wx(px); cam.y += by - wy(py);
+  requestDraw();
+}
+
+document.getElementById("zin").onclick  = ()=>zoomAt(viewW/2,viewH/2,1.4);
+document.getElementById("zout").onclick = ()=>zoomAt(viewW/2,viewH/2,1/1.4);
+document.getElementById("reset").onclick = fitView;
+document.getElementById("lbl").onclick = ()=>{ showCaptions=!showCaptions; requestDraw(); };
+document.getElementById("grid").onclick = ()=>{ showGrid=!showGrid; requestDraw(); };
+document.getElementById("cont").onclick = ()=>{ showContours=!showContours; requestDraw(); };
+
+window.addEventListener("resize", resize);
+buildElevation(); buildRivers(); buildTerrain(); buildContours();   // one-time terrain pre-compute
+resize(); fitView();
+</script>
+</body>
+</html>
